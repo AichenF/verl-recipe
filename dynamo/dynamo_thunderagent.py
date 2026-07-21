@@ -22,7 +22,9 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -39,18 +41,21 @@ _REQUEST_PROGRAM: ContextVar[tuple[str, bool] | None] = ContextVar(
 
 
 class DynamoThunderAgentHttpServer(DynamoHttpServer):
-    """Add program-aware routing while preserving PR #110's server stack."""
+    """Add optional program-aware routing while preserving PR #110's server stack."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._thunderagent_process: Optional[subprocess.Popen] = None
         self._thunderagent_log_fp = None
+        self._validate_program_routing_modes()
         if self._thunderagent_enabled():
             self._router_mode = "round-robin"
+        elif self._session_aware_enabled() and self._router_mode != "kv":
+            raise ValueError("native SessionAware admission control requires dynamo.router_mode=kv")
 
-    def _thunderagent_config(self) -> dict[str, Any]:
+    def _thunderagent_config(self) -> Mapping[str, Any]:
         config = self._dynamo_cfg().get("thunderagent", {}) or {}
-        if not isinstance(config, dict):
+        if not isinstance(config, Mapping):
             raise TypeError("rollout.engine_kwargs.dynamo.thunderagent must be a mapping")
         return config
 
@@ -59,6 +64,35 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         if not isinstance(value, bool):
             raise TypeError("rollout.engine_kwargs.dynamo.thunderagent.enabled must be a boolean")
         return value
+
+    def _session_aware_config(self) -> Mapping[str, Any]:
+        config = self._dynamo_cfg().get("session_aware", {}) or {}
+        if not isinstance(config, Mapping):
+            raise TypeError("rollout.engine_kwargs.dynamo.session_aware must be a mapping")
+        return config
+
+    def _session_aware_enabled(self) -> bool:
+        value = self._session_aware_config().get("enabled", False)
+        if not isinstance(value, bool):
+            raise TypeError("rollout.engine_kwargs.dynamo.session_aware.enabled must be a boolean")
+        return value
+
+    def _validate_program_routing_modes(self) -> None:
+        if self._thunderagent_enabled() and self._session_aware_enabled():
+            raise ValueError("ThunderAgent and native SessionAware admission control are mutually exclusive")
+
+    def _session_aware_policy_config_path(self) -> str:
+        configured = self._session_aware_config().get("policy_config_path")
+        if configured in (None, ""):
+            path = Path(__file__).resolve().parent / "config" / "session_aware_policy.yaml"
+        else:
+            path = Path(str(configured)).expanduser()
+            if not path.is_absolute():
+                raise ValueError("dynamo.session_aware.policy_config_path must be an absolute path")
+        path = path.resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"SessionAware router policy config does not exist: {path}")
+        return str(path)
 
     def _thunderagent_router_block_size(self) -> int:
         value = int(self._thunderagent_config().get("router_block_size", 16))
@@ -119,6 +153,13 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         args = super()._frontend_router_args()
         if self._thunderagent_enabled() and "--router-reset-states" not in args:
             args.append("--router-reset-states")
+        if self._session_aware_enabled():
+            if any(arg == "--router-policy-config" or arg.startswith("--router-policy-config=") for arg in args):
+                raise ValueError(
+                    "configure the native policy through dynamo.session_aware.policy_config_path, "
+                    "not dynamo.frontend_extra_args"
+                )
+            args.extend(["--router-policy-config", self._session_aware_policy_config_path()])
         return args
 
     def _start_thunderagent(self) -> None:
@@ -156,7 +197,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         if request_program is not None:
             session_id, is_final = request_program
             headers["X-Dynamo-Session-ID"] = session_id
-            if is_final:
+            if is_final and self._thunderagent_enabled():
                 headers["X-Dynamo-Session-Final"] = "true"
         return headers
 
@@ -186,15 +227,33 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         ) as response:
             return response.status, await response.text()
 
-    async def generate(self, *args, thunderagent_session_id: Optional[str] = None, **kwargs):
-        if not self._thunderagent_enabled():
+    async def generate(
+        self,
+        *args,
+        thunderagent_session_id: Optional[str] = None,
+        session_aware_session_id: Optional[str] = None,
+        **kwargs,
+    ):
+        if self._thunderagent_enabled():
+            session_id = thunderagent_session_id
+            mode_name = "ThunderAgent"
+        elif self._session_aware_enabled():
+            session_id = session_aware_session_id
+            mode_name = "native SessionAware"
+        else:
             return await super().generate(*args, **kwargs)
-        if not thunderagent_session_id:
-            raise RuntimeError("ThunderAgent generation requires a non-empty session ID")
+        if not session_id:
+            raise RuntimeError(f"{mode_name} generation requires a non-empty session ID")
         if self._use_direct_generate():
-            raise RuntimeError("direct_generate bypasses ThunderAgent and cannot be enabled")
+            raise RuntimeError(f"direct_generate bypasses {mode_name} and cannot be enabled")
+        if self._session_aware_enabled():
+            logger.info(
+                "[DynamoSessionAware] dispatch request_id=%s session_id=%s",
+                kwargs.get("request_id"),
+                session_id,
+            )
 
-        token = _REQUEST_PROGRAM.set((thunderagent_session_id, False))
+        token = _REQUEST_PROGRAM.set((session_id, False))
         try:
             return await super().generate(*args, **kwargs)
         finally:

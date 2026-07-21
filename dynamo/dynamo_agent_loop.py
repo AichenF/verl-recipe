@@ -21,6 +21,7 @@ replaces the generic server manager with a direct Dynamo server manager.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 from uuid import uuid4
@@ -50,23 +51,37 @@ class DynamoServerManager:
         servers: list[tuple[str, ray.actor.ActorHandle]],
         *,
         thunderagent_enabled: bool = False,
+        session_aware_enabled: bool = False,
     ):
         if len(servers) != 1:
             raise ValueError(f"DynamoServerManager expects exactly one shared server, got {len(servers)}")
+        if not isinstance(thunderagent_enabled, bool):
+            raise TypeError("thunderagent_enabled must be a boolean")
+        if not isinstance(session_aware_enabled, bool):
+            raise TypeError("session_aware_enabled must be a boolean")
+        if thunderagent_enabled and session_aware_enabled:
+            raise ValueError("ThunderAgent and native SessionAware admission control are mutually exclusive")
         self.server_address, self.server = servers[0]
         self.thunderagent_enabled = thunderagent_enabled
+        self.session_aware_enabled = session_aware_enabled
 
     @asynccontextmanager
     async def program_scope(self):
         """Bind all turns in one agent-loop run to one Dynamo program."""
-        if not self.thunderagent_enabled:
+        if not (self.thunderagent_enabled or self.session_aware_enabled):
             yield
             return
-        async with bind_program(uuid4().hex, self._finalize_program):
+        finalize = self._finalize_program if self.thunderagent_enabled else self._retain_native_session
+        async with bind_program(uuid4().hex, finalize):
             yield
 
     async def _finalize_program(self, session_id: str) -> None:
         await self.server.finalize_program.remote(session_id=session_id)
+
+    @staticmethod
+    async def _retain_native_session(_session_id: str) -> None:
+        """Native SessionAware sessions expire through Dynamo's retention timer."""
+        return None
 
     async def generate(
         self,
@@ -91,16 +106,22 @@ class DynamoServerManager:
             video_data=video_data,
             **kwargs,
         )
-        if not self.thunderagent_enabled:
+        if not (self.thunderagent_enabled or self.session_aware_enabled):
             return await self.server.generate.remote(**generate_kwargs)
 
         scope = current_program()
         if scope is None:
-            raise RuntimeError("Dynamo generation requires an active ThunderAgent program")
+            mode = "ThunderAgent" if self.thunderagent_enabled else "native SessionAware"
+            raise RuntimeError(f"Dynamo generation requires an active {mode} program")
+        session_kwarg = (
+            {"thunderagent_session_id": scope.session_id}
+            if self.thunderagent_enabled
+            else {"session_aware_session_id": scope.session_id}
+        )
         async with scope.request():
             return await self.server.generate.remote(
                 **generate_kwargs,
-                thunderagent_session_id=scope.session_id,
+                **session_kwarg,
             )
 
 
@@ -137,15 +158,21 @@ class DynamoLLMServerManager(LLMServerManager):
     def get_client(self, client_cls=None, **kwargs) -> DynamoServerManager:
         dynamo_config = (self.rollout_config.engine_kwargs or {}).get("dynamo", {}) or {}
         thunderagent_config = dynamo_config.get("thunderagent", {}) or {}
+        session_aware_config = dynamo_config.get("session_aware", {}) or {}
+        if not isinstance(thunderagent_config, Mapping):
+            raise TypeError("rollout.engine_kwargs.dynamo.thunderagent must be a mapping")
+        if not isinstance(session_aware_config, Mapping):
+            raise TypeError("rollout.engine_kwargs.dynamo.session_aware must be a mapping")
         servers = list(zip(self.server_addresses, self.server_handles, strict=True))
         return DynamoServerManager(
             servers,
-            thunderagent_enabled=bool(thunderagent_config.get("enabled", False)),
+            thunderagent_enabled=thunderagent_config.get("enabled", False),
+            session_aware_enabled=session_aware_config.get("enabled", False),
         )
 
 
 class DynamoAgentLoopWorker(AgentLoopWorker):
-    """Bind each trajectory to one ThunderAgent program."""
+    """Bind each trajectory to one program-aware Dynamo session."""
 
     async def _run_agent_loop(self, *args, **kwargs):
         async with self.llm_client.program_scope():

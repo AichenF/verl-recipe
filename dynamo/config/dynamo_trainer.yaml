@@ -30,6 +30,12 @@ actor_rollout_ref:
         thunderagent:
           enabled: true
           router_block_size: 16
+        # Native admission control from ai-dynamo/dynamo#11616. Keep this
+        # disabled while the legacy Python ThunderAgent router is enabled;
+        # a run may select exactly one of the two program-aware modes.
+        session_aware:
+          enabled: false
+          # policy_config_path: /absolute/path/to/router-policy.yaml
         # All keys optional; sane defaults applied in DynamoHttpServer.
         # namespace: verl_dynamo
         # router_mode: kv               # round-robin | kv | random | least-loaded
