@@ -71,17 +71,15 @@ class DynamoServerManager:
         if not (self.thunderagent_enabled or self.session_aware_enabled):
             yield
             return
-        finalize = self._finalize_program if self.thunderagent_enabled else self._retain_native_session
+        finalize = self._finalize_program if self.thunderagent_enabled else self._finalize_session_aware
         async with bind_program(uuid4().hex, finalize):
             yield
 
     async def _finalize_program(self, session_id: str) -> None:
         await self.server.finalize_program.remote(session_id=session_id)
 
-    @staticmethod
-    async def _retain_native_session(_session_id: str) -> None:
-        """Native SessionAware sessions expire through Dynamo's retention timer."""
-        return None
+    async def _finalize_session_aware(self, session_id: str) -> None:
+        await self.server.finalize_session_aware.remote(session_id=session_id)
 
     async def generate(
         self,

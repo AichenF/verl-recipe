@@ -1,10 +1,7 @@
-# Native SessionAware admission policy for agent trajectories.
-# The recipe supplies a stable X-Dynamo-Session-ID for every turn in one
-# trajectory. Keep the inactive-session lease short for the UniAgent rollout
-# benchmark: each validation batch creates many short-lived trajectories, and
-# the native default (1800s) can retain completed sessions long enough to fill
-# the admission accounting budget and leave later requests queued with idle
-# workers.
+# Native SessionAware admission policy for agent trajectories, using the full
+# configuration surface and defaults from Dynamo PR #11616 at 1c41eaf9.
+# verl explicitly finalizes completed trajectories; session retention is only
+# a fallback for clients or failures that do not deliver the final signal.
 default_policy_family: standard
 uncached_isl_buckets:
   - min_tokens: 0
@@ -14,8 +11,15 @@ policy_classes:
     policy_family: standard
     cache_bucket: all
     queue_policy: fcfs
-    queue_admission:
+    admission:
       type: session_aware
-      session_retention_seconds: 30
-      resume_timeout_seconds: 60
+      pause_threshold: 0.95
+      pause_target: 0.80
+      resume_hysteresis: 0.10
+      resume_timeout_seconds: 1800
+      session_retention_seconds: 1800
+      scheduler_interval_seconds: 5
+      acting_token_weight: 1.0
+      acting_decay_tau_seconds: 1.0
+      buffer_per_program: 100
     quantum: 1

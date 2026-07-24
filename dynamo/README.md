@@ -102,3 +102,40 @@ ruff format --check recipe/dynamo/thunderagent.py recipe/dynamo/dynamo_thunderag
 GPU validation should run the same model, prompts, concurrency, warmup, and
 measurement window twice, changing only `thunderagent.enabled`. Record
 throughput, latency, KV-cache hit rate, errors, and router pause/resume logs.
+
+## Native SessionAware admission control
+
+Native SessionAware is an alternative to the Python ThunderAgent router. The
+two modes are mutually exclusive. Native SessionAware runs the Dynamo frontend
+in KV-router mode and loads the admission policy directly; it does not launch
+the Python router.
+
+This integration was validated against Dynamo PR
+[#11616](https://github.com/ai-dynamo/dynamo/pull/11616) at commit
+`1c41eaf9cf5274b5c7ae61ad0bf63732ce09419c`.
+
+Disable ThunderAgent and enable SessionAware through Hydra:
+
+```yaml
+thunderagent:
+  enabled: false
+session_aware:
+  enabled: true
+  # policy_config_path: /absolute/path/to/router-policy.yaml
+  finalize_max_attempts: 3
+  finalize_retry_delay_s: 0.1
+```
+
+Each trajectory receives one stable `X-Dynamo-Session-ID`. On every normal,
+exceptional, or cancelled exit, the recipe drains admitted requests and sends
+one request with `X-Dynamo-Session-Final: true`. Native SessionAware releases
+its admission state and forwards that final request normally; the recipe
+discards the generated token. `session_retention_seconds` remains a fallback
+for clients or failures that do not deliver the final signal.
+
+The default policy is
+[`config/session_aware_policy.yaml`](config/session_aware_policy.yaml). It
+lists the complete scheduler configuration supported by the tested PR using
+upstream defaults. Override `policy_config_path` for experiments; scheduler
+algorithm parameters remain in the policy YAML rather than being duplicated
+as Hydra fields.

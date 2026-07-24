@@ -197,7 +197,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         if request_program is not None:
             session_id, is_final = request_program
             headers["X-Dynamo-Session-ID"] = session_id
-            if is_final and self._thunderagent_enabled():
+            if is_final:
                 headers["X-Dynamo-Session-Final"] = "true"
         return headers
 
@@ -246,12 +246,6 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             raise RuntimeError(f"{mode_name} generation requires a non-empty session ID")
         if self._use_direct_generate():
             raise RuntimeError(f"direct_generate bypasses {mode_name} and cannot be enabled")
-        if self._session_aware_enabled():
-            logger.info(
-                "[DynamoSessionAware] dispatch request_id=%s session_id=%s",
-                kwargs.get("request_id"),
-                session_id,
-            )
 
         token = _REQUEST_PROGRAM.set((session_id, False))
         try:
@@ -311,6 +305,57 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
                 if attempt < attempts:
                     await asyncio.sleep(self._finalize_retry_delay())
             raise RuntimeError(f"ThunderAgent final request failed after {attempts} attempts") from last_error
+        finally:
+            _REQUEST_PROGRAM.reset(token)
+
+    def _session_aware_finalize_max_attempts(self) -> int:
+        attempts = int(self._session_aware_config().get("finalize_max_attempts", 3))
+        if attempts <= 0:
+            raise ValueError("session_aware.finalize_max_attempts must be positive")
+        return attempts
+
+    def _session_aware_finalize_retry_delay(self) -> float:
+        delay = float(self._session_aware_config().get("finalize_retry_delay_s", 0.1))
+        if delay < 0:
+            raise ValueError("session_aware.finalize_retry_delay_s must be non-negative")
+        return delay
+
+    @staticmethod
+    def _validate_session_aware_final_response(status: int, body: str) -> None:
+        if not 200 <= status < 300:
+            raise RuntimeError(f"SessionAware final request failed status={status} body={body[:2000]!r}")
+
+    async def finalize_session_aware(self, session_id: str) -> None:
+        """Release native SessionAware state and discard the forwarded completion."""
+        if not self._session_aware_enabled():
+            return
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+
+        request_id = f"session-aware-final-{uuid4().hex}"
+        payload = {
+            "model": self._served_model_name or self.model_config.local_path,
+            "prompt": [0],
+            "max_tokens": 1,
+            "stream": False,
+        }
+        token = _REQUEST_PROGRAM.set((session_id, True))
+        try:
+            last_error = None
+            attempts = self._session_aware_finalize_max_attempts()
+            for attempt in range(1, attempts + 1):
+                try:
+                    status, body = await self._frontend_post(payload, request_id)
+                except Exception as error:
+                    last_error = error
+                else:
+                    if status not in {408, 429} and status < 500:
+                        self._validate_session_aware_final_response(status, body)
+                        return
+                    last_error = RuntimeError(f"SessionAware final request failed status={status} body={body[:2000]!r}")
+                if attempt < attempts:
+                    await asyncio.sleep(self._session_aware_finalize_retry_delay())
+            raise RuntimeError(f"SessionAware final request failed after {attempts} attempts") from last_error
         finally:
             _REQUEST_PROGRAM.reset(token)
 

@@ -36,6 +36,8 @@ actor_rollout_ref:
         session_aware:
           enabled: false
           # policy_config_path: /absolute/path/to/router-policy.yaml
+          finalize_max_attempts: 3
+          finalize_retry_delay_s: 0.1
         # All keys optional; sane defaults applied in DynamoHttpServer.
         # namespace: verl_dynamo
         # router_mode: kv               # round-robin | kv | random | least-loaded
